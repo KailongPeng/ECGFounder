@@ -1,0 +1,34 @@
+# Model checkpoints (large files)
+checkpoint/
+
+# Evaluation results
+res/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PDF papers (large files)
+*.pdf
+
+# Tmux history dumps
+all_history*.txt
+
+# Data directories
+data/
+*.dat
+*.hea
+*.csv.gz
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
