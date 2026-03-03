@@ -139,15 +139,26 @@ class PTBXLMIDataset(Dataset):
     """
 
     def __init__(self, ecg_path: str, ptbxl_csv: str,
-                 folds=None, threshold: float = 0.0, lead: str = 'single'):
+                 folds=None, threshold: float = 0.0, lead: str = 'single',
+                 sampling_rate: int = 500):
         assert lead in ('single', 'multi'), "lead must be 'single' or 'multi'"
+        assert sampling_rate in (100, 500), "sampling_rate must be 100 or 500"
         df = pd.read_csv(ptbxl_csv)
         if folds is not None:
             df = df[df['strat_fold'].isin(folds)].reset_index(drop=True)
-        self.records = df['filename_hr'].tolist()
+        fname_col = 'filename_lr' if sampling_rate == 100 else 'filename_hr'
+        # Filter out records with missing .dat or .hea files
+        def file_ok(row):
+            base = os.path.join(ecg_path, row[fname_col])
+            return os.path.exists(base + '.dat') and os.path.exists(base + '.hea')
+        mask = df.apply(file_ok, axis=1)
+        df = df[mask].reset_index(drop=True)
+        self.records = df[fname_col].tolist()
+        self.seq_len = sampling_rate * 10  # 10 seconds: 100Hz→1000, 500Hz→5000
         self.labels = self._build_labels(df, threshold)
         self.ecg_path = ecg_path
         self.lead = lead
+        self.sampling_rate = sampling_rate
 
     def _build_labels(self, df: pd.DataFrame, threshold: float) -> np.ndarray:
         """Returns (N, 9) binary float32 array."""
@@ -167,10 +178,10 @@ class PTBXLMIDataset(Dataset):
 
     def __getitem__(self, idx):
         path = os.path.join(self.ecg_path, self.records[idx])
-        data, fs = read_wfdb(path)          # (12, T)
-        data = preprocess_ecg(data, fs)     # (12, 5000)
+        data, fs = read_wfdb(path)                          # (12, T)
+        data = preprocess_ecg(data, fs, fs_out=self.seq_len)  # (12, seq_len)
         if self.lead == 'single':
-            data = data[0:1, :]             # (1, 5000)
+            data = data[0:1, :]                             # (1, seq_len)
         label = torch.FloatTensor(self.labels[idx])
         return torch.FloatTensor(data), label
 

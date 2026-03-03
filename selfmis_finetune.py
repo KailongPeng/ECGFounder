@@ -46,16 +46,18 @@ def build_finetune_model(device: torch.device,
                          fs_pth: str,
                          n_classes: int = 9,
                          linear_prob: bool = True,
-                         pretrained_format: str = 'selfmis') -> Net1D:
+                         pretrained_format: str = 'selfmis',
+                         no_pretrain: bool = False) -> Net1D:
     """
     Load fs backbone and prepare for fine-tuning.
 
     Args:
-        fs_pth:            Path to checkpoint file.
+        fs_pth:            Path to checkpoint file (ignored if no_pretrain=True).
         n_classes:         Output classes (9 for MI detection).
         linear_prob:       If True, freeze all layers except the dense head.
         pretrained_format: 'selfmis'    → ckpt['state_dict'] is the complete fs Net1D
                            'ecgfounder' → original 150-class ECGFounder checkpoint
+        no_pretrain:       If True, skip checkpoint loading (random init).
 
     Returns:
         Net1D model with dense layer replaced by Linear(1024, n_classes).
@@ -71,21 +73,14 @@ def build_finetune_model(device: torch.device,
         groups_width=16,
         verbose=False,
         use_bn=False,
-        use_do=False,
+        use_do=True,
         n_classes=n_classes,
         return_features=False,
     )
 
-    ckpt = torch.load(fs_pth, map_location=device, weights_only=False)
-    sd = ckpt['state_dict']
-
-    if pretrained_format == 'ecgfounder':
-        # Strip the 150-class dense layer; load backbone only
-        sd = {k: v for k, v in sd.items() if not k.startswith('dense.')}
-        model.load_state_dict(sd, strict=False)
-    else:
-        # SelfMIS checkpoint: state_dict is already the full fs (may have dense.*)
-        # We strip the old dense layer and let the new one initialise randomly
+    if not no_pretrain:
+        ckpt = torch.load(fs_pth, map_location=device, weights_only=False)
+        sd = ckpt['state_dict']
         sd = {k: v for k, v in sd.items() if not k.startswith('dense.')}
         model.load_state_dict(sd, strict=False)
 
@@ -168,6 +163,7 @@ def finetune(
     pretrained_format: str = 'selfmis',
     n_classes: int = 9,
     linear_prob: bool = True,
+    no_pretrain: bool = False,
     epochs: int = 20,
     batch_size: int = 64,
     lr: float = 5e-4,
@@ -196,9 +192,12 @@ def finetune(
 
     # ---- Datasets ----
     train_ds = PTBXLMIDataset(ptbxl_root, ptbxl_csv,
-                              folds=list(range(1, 9)), threshold=threshold)
-    val_ds   = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[9],  threshold=threshold)
-    test_ds  = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[10], threshold=threshold)
+                              folds=list(range(1, 9)), threshold=threshold,
+                              sampling_rate=100)
+    val_ds   = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[9],  threshold=threshold,
+                              sampling_rate=100)
+    test_ds  = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[10], threshold=threshold,
+                              sampling_rate=100)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)
@@ -218,7 +217,8 @@ def finetune(
     # ---- Model ----
     model = build_finetune_model(device, fs_pth, n_classes=n_classes,
                                  linear_prob=linear_prob,
-                                 pretrained_format=pretrained_format)
+                                 pretrained_format=pretrained_format,
+                                 no_pretrain=no_pretrain)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f'Trainable params: {trainable:,} / {total:,}')
@@ -319,21 +319,24 @@ def finetune(
 
 def parse_args():
     p = argparse.ArgumentParser(description='SelfMIS Fine-tuning')
-    p.add_argument('--fs_pth', required=True,
+    p.add_argument('--fs_pth', default=None,
                    help='Path to pretrained fs checkpoint '
-                        '(selfmis_pretrained_fs.pth or 1_lead_ECGFounder.pth)')
+                        '(selfmis_pretrained_fs.pth or 1_lead_ECGFounder.pth); '
+                        'not required when --no_pretrain is set')
     p.add_argument('--ptbxl_root', default=PTB_ROOT)
     p.add_argument('--ptbxl_csv',  default=PTB_CSV)
     p.add_argument('--save_dir',   default='./checkpoint/selfmis_finetune')
     p.add_argument('--ablation',   default='full',
                    choices=['full', 'no_s_pretrained', 'no_m_pretrained',
-                            'alignment_disabled'])
+                            'alignment_disabled', 'scratch_full_ft'])
     p.add_argument('--pretrained_format', default='selfmis',
                    choices=['selfmis', 'ecgfounder'])
     p.add_argument('--n_classes',    type=int,   default=9)
     p.add_argument('--linear_prob',  action='store_true', default=True)
     p.add_argument('--full_finetune', action='store_true',
                    help='Full fine-tuning (all layers); overrides --linear_prob')
+    p.add_argument('--no_pretrain', action='store_true',
+                   help='Random init, skip checkpoint loading (fair scratch baseline)')
     p.add_argument('--epochs',       type=int,   default=20)
     p.add_argument('--batch_size',   type=int,   default=64)
     p.add_argument('--lr',           type=float, default=5e-4)
@@ -356,6 +359,7 @@ if __name__ == '__main__':
         pretrained_format=args.pretrained_format,
         n_classes=args.n_classes,
         linear_prob=linear_prob,
+        no_pretrain=args.no_pretrain,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
