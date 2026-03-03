@@ -47,7 +47,8 @@ def build_finetune_model(device: torch.device,
                          n_classes: int = 9,
                          linear_prob: bool = True,
                          pretrained_format: str = 'selfmis',
-                         no_pretrain: bool = False) -> Net1D:
+                         no_pretrain: bool = False,
+                         in_channels: int = 1) -> Net1D:
     """
     Load fs backbone and prepare for fine-tuning.
 
@@ -58,12 +59,13 @@ def build_finetune_model(device: torch.device,
         pretrained_format: 'selfmis'    → ckpt['state_dict'] is the complete fs Net1D
                            'ecgfounder' → original 150-class ECGFounder checkpoint
         no_pretrain:       If True, skip checkpoint loading (random init).
+        in_channels:       Number of input channels (1=Lead I, 12=all leads).
 
     Returns:
         Net1D model with dense layer replaced by Linear(1024, n_classes).
     """
     model = Net1D(
-        in_channels=1,
+        in_channels=in_channels,
         base_filters=64,
         ratio=1,
         filter_list=[64, 160, 160, 400, 400, 1024, 1024],
@@ -79,7 +81,7 @@ def build_finetune_model(device: torch.device,
     )
 
     if not no_pretrain:
-        ckpt = torch.load(fs_pth, map_location=device, weights_only=False)
+        ckpt = torch.load(fs_pth, map_location='cpu', weights_only=False)
         sd = ckpt['state_dict']
         sd = {k: v for k, v in sd.items() if not k.startswith('dense.')}
         model.load_state_dict(sd, strict=False)
@@ -164,6 +166,10 @@ def finetune(
     n_classes: int = 9,
     linear_prob: bool = True,
     no_pretrain: bool = False,
+    resume_from: str = None,
+    warmup_epochs: int = 0,
+    lead: str = 'single',
+    sampling_rate: int = 100,
     epochs: int = 20,
     batch_size: int = 64,
     lr: float = 5e-4,
@@ -187,17 +193,19 @@ def finetune(
     save_dir = os.path.join(save_dir, ablation)
     os.makedirs(save_dir, exist_ok=True)
 
+    in_channels = 12 if lead == 'multi' else 1
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device}  |  Ablation: {ablation}  |  linear_prob: {linear_prob}')
+    print(f'Device: {device}  |  Ablation: {ablation}  |  linear_prob: {linear_prob}'
+          f'  |  lead: {lead} ({in_channels}ch)  |  sampling_rate: {sampling_rate}Hz')
 
     # ---- Datasets ----
     train_ds = PTBXLMIDataset(ptbxl_root, ptbxl_csv,
                               folds=list(range(1, 9)), threshold=threshold,
-                              sampling_rate=100)
+                              lead=lead, sampling_rate=sampling_rate)
     val_ds   = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[9],  threshold=threshold,
-                              sampling_rate=100)
+                              lead=lead, sampling_rate=sampling_rate)
     test_ds  = PTBXLMIDataset(ptbxl_root, ptbxl_csv, folds=[10], threshold=threshold,
-                              sampling_rate=100)
+                              lead=lead, sampling_rate=sampling_rate)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=True)
@@ -215,10 +223,30 @@ def finetune(
           + ', '.join(f'{MI_CODES[i]}={pos_counts[i]}' for i in range(len(MI_CODES))))
 
     # ---- Model ----
-    model = build_finetune_model(device, fs_pth, n_classes=n_classes,
-                                 linear_prob=linear_prob,
-                                 pretrained_format=pretrained_format,
-                                 no_pretrain=no_pretrain)
+    if resume_from:
+        # 2-stage: load a fully-trained model (e.g. LP checkpoint) and
+        # optionally unfreeze all layers for continued fine-tuning.
+        print(f'Resuming from: {resume_from}')
+        model = Net1D(
+            in_channels=in_channels, base_filters=64, ratio=1,
+            filter_list=[64, 160, 160, 400, 400, 1024, 1024],
+            m_blocks_list=[2, 2, 2, 3, 3, 4, 4],
+            kernel_size=16, stride=2, groups_width=16,
+            verbose=False, use_bn=False, use_do=True,
+            n_classes=n_classes, return_features=False,
+        )
+        ckpt = torch.load(resume_from, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['state_dict'])
+        if not linear_prob:
+            for param in model.parameters():
+                param.requires_grad = True
+        model = model.to(device)
+    else:
+        model = build_finetune_model(device, fs_pth, n_classes=n_classes,
+                                     linear_prob=linear_prob,
+                                     pretrained_format=pretrained_format,
+                                     no_pretrain=no_pretrain,
+                                     in_channels=in_channels)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     print(f'Trainable params: {trainable:,} / {total:,}')
@@ -227,9 +255,51 @@ def finetune(
     pos_weight = compute_pos_weight(train_labels).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    # ---- Warmup phase: train head only (prevents random head from corrupting backbone) ----
+    use_discriminative = (not linear_prob and not no_pretrain
+                          and (resume_from or fs_pth))
+    if use_discriminative and warmup_epochs > 0:
+        print(f'\n=== Head warmup: {warmup_epochs} epochs (backbone frozen) ===')
+        # Freeze backbone
+        for name, param in model.named_parameters():
+            if 'dense' not in name:
+                param.requires_grad = False
+        warmup_opt = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr, weight_decay=weight_decay)
+        for we in range(warmup_epochs):
+            model.train()
+            wloss = 0.0
+            for x, y in tqdm(train_loader, desc=f'Warmup {we:02d}', leave=False):
+                x, y = x.to(device), y.to(device)
+                warmup_opt.zero_grad(set_to_none=True)
+                loss = criterion(model(x), y)
+                loss.backward()
+                warmup_opt.step()
+                wloss += loss.item()
+            wloss /= len(train_loader)
+            val_gt, val_pred = _infer(model, val_loader, device)
+            val_auroc = _compute_auroc(val_gt, val_pred, MI_CODES)['mean']
+            print(f'Warmup {we:02d}  loss={wloss:.4f}  val_AUROC={val_auroc:.4f}')
+        # Unfreeze backbone for main training
+        for param in model.parameters():
+            param.requires_grad = True
+        print(f'=== Warmup done. Unfreezing backbone. ===\n')
+
     # ---- Optimizer ----
-    opt_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer  = torch.optim.AdamW(opt_params, lr=lr, weight_decay=weight_decay)
+    if use_discriminative:
+        backbone_params = [p for n, p in model.named_parameters()
+                           if 'dense' not in n and p.requires_grad]
+        head_params = [p for n, p in model.named_parameters()
+                       if 'dense' in n and p.requires_grad]
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': lr / 10},
+            {'params': head_params, 'lr': lr},
+        ], weight_decay=weight_decay)
+        print(f'Discriminative LR: backbone={lr/10:.2e}, head={lr:.2e}')
+    else:
+        opt_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer  = torch.optim.AdamW(opt_params, lr=lr, weight_decay=weight_decay)
     scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs)
 
@@ -328,7 +398,12 @@ def parse_args():
     p.add_argument('--save_dir',   default='./checkpoint/selfmis_finetune')
     p.add_argument('--ablation',   default='full',
                    choices=['full', 'no_s_pretrained', 'no_m_pretrained',
-                            'alignment_disabled', 'scratch_full_ft'])
+                            'alignment_disabled', 'scratch_full_ft',
+                            'ecgf_pretrain_full_ft', 'selfmis_pretrain_full_ft',
+                            'ecgf_pretrain_full_ft_dlr',
+                            'ecgf_12lead_scratch_full_ft',
+                            'scratch_full_ft_500hz',
+                            'ecgf_pretrain_lp_500hz'])
     p.add_argument('--pretrained_format', default='selfmis',
                    choices=['selfmis', 'ecgfounder'])
     p.add_argument('--n_classes',    type=int,   default=9)
@@ -337,6 +412,13 @@ def parse_args():
                    help='Full fine-tuning (all layers); overrides --linear_prob')
     p.add_argument('--no_pretrain', action='store_true',
                    help='Random init, skip checkpoint loading (fair scratch baseline)')
+    p.add_argument('--resume_from', default=None,
+                   help='Path to a fully-trained model checkpoint (e.g. LP best_model.pth) '
+                        'to resume from. Loads full state_dict, ignores --fs_pth. '
+                        'Use with --full_finetune for 2-stage training.')
+    p.add_argument('--warmup_epochs', type=int,   default=0,
+                   help='Epochs to train head only before unfreezing backbone '
+                        '(prevents random head from corrupting pretrained features)')
     p.add_argument('--epochs',       type=int,   default=20)
     p.add_argument('--batch_size',   type=int,   default=64)
     p.add_argument('--lr',           type=float, default=5e-4)
@@ -344,6 +426,12 @@ def parse_args():
     p.add_argument('--patience',     type=int,   default=5)
     p.add_argument('--num_workers',  type=int,   default=4)
     p.add_argument('--threshold',    type=float, default=0.0)
+    p.add_argument('--lead',         default='single',
+                   choices=['single', 'multi'],
+                   help="'single' → Lead I (1ch); 'multi' → 12-lead (12ch)")
+    p.add_argument('--sampling_rate', type=int,   default=100,
+                   choices=[100, 500],
+                   help='Sampling rate: 100Hz (1000pts) or 500Hz (5000pts)')
     return p.parse_args()
 
 
@@ -360,6 +448,10 @@ if __name__ == '__main__':
         n_classes=args.n_classes,
         linear_prob=linear_prob,
         no_pretrain=args.no_pretrain,
+        resume_from=args.resume_from,
+        warmup_epochs=args.warmup_epochs,
+        lead=args.lead,
+        sampling_rate=args.sampling_rate,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
